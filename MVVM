@@ -1,0 +1,129 @@
+VM → UseCase → Repository Template (for a new feature)
+
+The `InstantRequest` submit flow is the cleanest example that includes a **UseCase** layer (business rule sits between ViewModel and Repository — here, deciding which endpoint to call based on `RequestType`).
+
+**Repository** — raw API calls, no business logic:
+
+```swift
+protocol InstantRequestRepositoryProtocol {
+    func submitInstantRequest(_ data: InstantRequestFormEntity) async throws -> BaseResponse
+    func submitNormalRequest(_ data: InstantRequestFormEntity) async throws -> BaseResponse
+    func updateRequestDetail(id: String, data: UpdateRequestDetailEntity) async throws -> BaseResponse
+}
+
+final class InstantRequestRepository: InstantRequestRepositoryProtocol {
+    let networkService: NetworkServiceProtocol
+
+    init(networkService: NetworkServiceProtocol) {
+        self.networkService = networkService
+    }
+
+    func submitInstantRequest(_ data: InstantRequestFormEntity) async throws -> BaseResponse {
+        try await networkService.request(.submitInstantRequest(data: data))
+    }
+
+    func submitNormalRequest(_ data: InstantRequestFormEntity) async throws -> BaseResponse {
+        try await networkService.request(.submitNormalRequest(data: data))
+    }
+
+    func updateRequestDetail(id: String, data: UpdateRequestDetailEntity) async throws -> BaseResponse {
+        try await networkService.request(.updateRequest(id: id, data: data))
+    }
+}
+```
+
+**UseCase** — the one place that decides *which* repository call to make and maps the response to a simple `Bool`:
+
+```swift
+protocol InstantRequestUseCaseProtocol {
+    func execute(request: InstantRequestFormEntity, type: RequestType) async throws -> Bool
+    func updateRequest(with id: String, data: UpdateRequestDetailEntity) async throws -> Bool
+}
+
+final class InstantRequestUseCase: InstantRequestUseCaseProtocol {
+    private let repository: InstantRequestRepositoryProtocol
+
+    init(repository: InstantRequestRepositoryProtocol) {
+        self.repository = repository
+    }
+
+    func execute(request: InstantRequestFormEntity, type: RequestType) async throws -> Bool {
+        let response: BaseResponse
+        if type == .instant {
+            response = try await repository.submitInstantRequest(request)
+        } else {
+            response = try await repository.submitNormalRequest(request)
+        }
+        return response.success
+    }
+
+    func updateRequest(with id: String, data: UpdateRequestDetailEntity) async throws -> Bool {
+        let response = try await repository.updateRequestDetail(id: id, data: data)
+        return response.success
+    }
+}
+```
+
+**ViewModel** — depends only on the UseCase protocol, never touches `NetworkService` or `APIRouter` directly:
+
+```swift
+@MainActor
+final class InstantRequestFormViewModel: ObservableObject {
+    private let instantRequestUseCase: InstantRequestUseCaseProtocol
+    private let type: RequestType
+    @Published var requestData: InstantRequestFormEntity
+
+    init(router: Router, licenseNo: String?, type: RequestType,
+         repository: InstantRequestRepositoryProtocol, requestData: InstantRequestFormEntity,
+         instantRequestUseCase: InstantRequestUseCaseProtocol, lookupUseCase: LookupUseCase) {
+        self.type = type
+        self.instantRequestUseCase = instantRequestUseCase
+        self.requestData = requestData
+    }
+
+    func submit() async -> Bool {
+        do {
+            return try await instantRequestUseCase.execute(request: requestData, type: type)
+        } catch {
+            AppLogger.shared.error("Submit failed: \(error.localizedDescription)")
+            return false
+        }
+    }
+}
+```
+
+**Wiring it together** — `DIContainer` composes Repository → UseCase → ViewModel → View, so callers only ever ask for the fully-built View:
+
+```swift
+@MainActor
+final class DependencyContainer {
+    static let shared = DependencyContainer()
+    private let networkService = NetworkService.shared
+
+    lazy var instantRequestRepository: InstantRequestRepositoryProtocol = {
+        InstantRequestRepository(networkService: networkService)
+    }()
+
+    lazy var instantRequestUseCase: InstantRequestUseCaseProtocol = {
+        InstantRequestUseCase(repository: instantRequestRepository)
+    }()
+
+    func makeInstantRequestFormView(licenseNo: String?, data: InstantRequestFormEntity, type: RequestType) -> InstantRequestFormView {
+        let viewModel = InstantRequestFormViewModel(
+            router: router, licenseNo: licenseNo, type: type,
+            repository: instantRequestRepository, requestData: data,
+            instantRequestUseCase: instantRequestUseCase, lookupUseCase: lookupUseCase)
+        return InstantRequestFormView(viewModel: viewModel)
+    }
+}
+```
+
+### How to reuse this template for a brand-new feature
+
+1. Add the endpoint(s) as new `APIRouter` cases (path / method / body).
+2. Create `<Feature>Repository` conforming to `<Feature>RepositoryProtocol` — one method per endpoint, always `try await networkService.request(.yourCase(...))`.
+3. (Optional, if there's branching logic or multiple repository calls combined) create `<Feature>UseCase` that depends on the repository protocol and exposes one clear method to the ViewModel.
+4. Create `<Feature>ViewModel: ObservableObject`, `@MainActor`, depending only on the UseCase (or Repository directly for simple CRUD) — never on `NetworkService`.
+5. Register `lazy var` repository + usecase in `DependencyContainer`, and add a `make<Feature>View()` factory method that builds ViewModel + View together.
+
+---
